@@ -267,6 +267,89 @@ class TestCortadoOrchestrator(unittest.TestCase):
         self.assertEqual(score_fail, 0.0)
         self.assertIn("blind SQL", response_fail)
 
+    @patch("evaluator.cortadoevaluator.databases.get_database")
+    @patch("evaluator.cortadoevaluator.GrpcProxyModel")
+    def test_cortado_evaluator_deterministic_static_replay(self, mock_grpc_model, mock_get_database):
+        from evaluator.cortadoevaluator import CortadoEvaluator
+        from dataset.cortadoinput import EvalCortadoRequest
+
+        mock_db = MagicMock()
+        mock_db.execute.side_effect = [
+            ([{"count": 50}], None, None),  # Turn 1 golden
+            ([{"count": 50}], None, None),  # Turn 1 generated
+            ([{"avg_age": 28.5}], None, None),  # Turn 2 golden
+            ([{"avg_age": 28.5}], None, None),  # Turn 2 generated
+        ]
+        mock_get_database.return_value = mock_db
+
+        mock_generator = MagicMock()
+        prompts_seen = []
+        def mock_generate(eval_result):
+            prompts_seen.append(eval_result.nl_prompt)
+            if "female" in eval_result.nl_prompt:
+                eval_result.generated_nl_response = "Filtered for females"
+                eval_result.generated_sql = "SELECT AVG(age) FROM users WHERE gender = 'F';"
+            else:
+                eval_result.generated_nl_response = "Acquired in 2023"
+                eval_result.generated_sql = "SELECT traffic_source, COUNT(*) FROM users WHERE year=2023 GROUP BY 1;"
+        mock_generator.generate.side_effect = mock_generate
+        mock_grpc_model.return_value = mock_generator
+
+        config = {
+            "model_config": {"generator": "grpc_proxy"},
+            "scorers": {"set_match": {}},
+            "runners": {"agent_runners": 1},
+        }
+        evaluator = CortadoEvaluator(config=config, db_configs={"bigquery": [{"db_type": "bigquery"}]})
+
+        # Structured static sequence turns
+        scenario = {
+            "id": "seq_564",
+            "conversation_id": "conv_13075662202254699956",
+            "turns": [
+                {
+                    "turn_id": 1,
+                    "user_prompt": "How many users did we acquire in 2023 by source?",
+                    "golden_sql": "SELECT traffic_source, COUNT(*) FROM users WHERE year=2023 GROUP BY 1;"
+                },
+                {
+                    "turn_id": 2,
+                    "user_prompt": "Can we filter those to just show female users?",
+                    "golden_sql": "SELECT AVG(age) FROM users WHERE gender = 'F';"
+                }
+            ],
+            "database": "anarres-bigquery-test",
+            "dialects": ["bigquery"]
+        }
+        eval_result = EvalCortadoRequest(raw_dict=scenario)
+
+        # Simulated user should NOT be called when static turns exist
+        mock_simulated_user = MagicMock()
+
+        evaluator.process_scenario(
+            scenario=scenario,
+            eval_result=eval_result,
+            job_id="test_replay_job",
+            metadata={"dialects": ["bigquery"], "database": "anarres-bigquery-test"},
+            simulated_user=mock_simulated_user
+        )
+
+        mock_simulated_user.get_next_response.assert_not_called()
+        self.assertEqual(len(prompts_seen), 2)
+        self.assertEqual(prompts_seen[0], "How many users did we acquire in 2023 by source?")
+        self.assertEqual(prompts_seen[1], "Can we filter those to just show female users?")
+
+        final_output = eval_result.agent_results[0]
+        self.assertEqual(len(final_output["turn_history"]), 2)
+        self.assertEqual(final_output["turn_history"][0]["set_match"], 100.0)
+        self.assertEqual(final_output["turn_history"][1]["set_match"], 100.0)
+
+        # Verify conversation_history JSON formatting
+        conv_hist = json.loads(final_output["conversation_history"])
+        self.assertEqual(len(conv_hist), 4)  # 2 user turns + 2 assistant turns
+        self.assertEqual(conv_hist[0]["role"], "user")
+        self.assertEqual(conv_hist[1]["role"], "assistant")
+
 
 if __name__ == "__main__":
     unittest.main()

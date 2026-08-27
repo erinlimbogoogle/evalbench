@@ -270,8 +270,19 @@ class CortadoEvaluator:
     ) -> Any:
         """Communication between Cortado and the Simulated User."""
 
-        current_prompt = scenario.get("starting_prompt", "")
-        max_turns = scenario.get("max_turns", 1)
+        turns = scenario.get("turns", [])
+        is_static_replay = bool(turns) or self.config.get("static_replay", False)
+        if turns:
+            max_turns = len(turns)
+        else:
+            max_turns = scenario.get("max_turns", 1)
+
+        current_prompt = ""
+        if turns and len(turns) > 0:
+            current_prompt = turns[0].get("user_prompt") or turns[0].get("prompt") or scenario.get("starting_prompt", "")
+        else:
+            current_prompt = scenario.get("starting_prompt", "")
+
         conversation_plan = scenario.get("conversation_plan", [])
         conversation_history: List[Dict[str, str]] = []
         turn_history: List[Dict[str, Any]] = []
@@ -292,6 +303,9 @@ class CortadoEvaluator:
         db = self._get_db(database_name, dialect)
 
         for turn in range(max_turns):
+            if is_static_replay and turns and turn < len(turns):
+                current_prompt = turns[turn].get("user_prompt") or turns[turn].get("prompt") or current_prompt
+
             logging.info(f"Turn {turn + 1}/{max_turns} - Prompt: {current_prompt}")
 
             # Inject the current prompt into the object
@@ -313,7 +327,7 @@ class CortadoEvaluator:
                 sql_reply = ""
 
             last_agent_text = agent_text
-            logging.info(f"Turn {turn + 1}/{max_turns} - Agent Reply to Simulated User: {agent_text}")
+            logging.info(f"Turn {turn + 1}/{max_turns} - Agent Reply: {agent_text}")
 
             # Extract tools & skills for this turn
             turn_tools, turn_skills = extract_tools_and_skills_from_turn(
@@ -374,23 +388,27 @@ class CortadoEvaluator:
                 last_gen_err = gen_err
                 last_golden_err = golden_err
 
-            # Log history
+            # Log history in standard format
             conversation_history.append({
                 "user": current_prompt,
                 "agent": agent_text,
             })
 
-            # Invoke Simulated User to check plan and generate next turn
-            if turn < max_turns - 1 and simulated_user:
-                next_response = simulated_user.get_next_response(
-                    conversation_plan, conversation_history, agent_text
-                )
-                if "TERMINATE" in next_response:
-                    logging.info("Simulated user met the goal and terminated the conversation.")
+            # Next turn determination: static replay vs simulated user
+            if turn < max_turns - 1:
+                if is_static_replay and turns and (turn + 1) < len(turns):
+                    # Advance to next pre-scripted prompt deterministically
+                    current_prompt = turns[turn + 1].get("user_prompt") or turns[turn + 1].get("prompt") or ""
+                elif simulated_user:
+                    next_response = simulated_user.get_next_response(
+                        conversation_plan, conversation_history, agent_text
+                    )
+                    if "TERMINATE" in next_response:
+                        logging.info("Simulated user met the goal and terminated the conversation.")
+                        break
+                    current_prompt = next_response
+                else:
                     break
-                current_prompt = next_response
-            else:
-                break
 
         # Finalize and Score
         self._finalize_scenario(
@@ -431,6 +449,23 @@ class CortadoEvaluator:
         last_golden_err: Any = None,
     ):
         """Packages the conversation and sends it to the scoring engine."""
+        # Ensure conversation_history has standard role/content entries
+        formatted_history = []
+        for item in conversation_history:
+            if isinstance(item, dict):
+                if "role" in item and "content" in item:
+                    formatted_history.append(item)
+                else:
+                    if "user" in item:
+                        formatted_history.append({"role": "user", "content": str(item["user"])})
+                    if "agent" in item:
+                        formatted_history.append({"role": "assistant", "content": str(item["agent"])})
+
+        if not formatted_history:
+            formatted_history = [
+                {"role": "user", "content": scenario.get("starting_prompt", "")},
+                {"role": "assistant", "content": last_response}
+            ]
 
         eval_output_data = {
             "eval_id": scenario["id"],
@@ -445,8 +480,8 @@ class CortadoEvaluator:
             "golden_sql": last_golden_sql,
             "generated_result": last_gen_res if last_gen_res is not None else accumulated_tools,
             "golden_result": last_golden_res if last_golden_res is not None else scenario.get("expected_trajectory", []),
-            "prompt": scenario["starting_prompt"],
-            "conversation_history": json.dumps(conversation_history, indent=2),
+            "prompt": scenario.get("starting_prompt", ""),
+            "conversation_history": json.dumps(formatted_history, indent=2),
             "turn_history": turn_history or [],
             "scenario": scenario,
             "accumulated_tools": accumulated_tools,

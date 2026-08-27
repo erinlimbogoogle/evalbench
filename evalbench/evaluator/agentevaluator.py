@@ -109,9 +109,20 @@ class AgentEvaluator:
         simulated_user: Any = None
     ):
         """Processes a single scenario."""
-        current_prompt = scenario["starting_prompt"]
+        turns = scenario.get("turns", [])
+        is_static_replay = bool(turns) or self.config.get("static_replay", False)
+        if turns:
+            max_turns = len(turns)
+        else:
+            max_turns = scenario.get("max_turns", 1)
+
+        current_prompt = ""
+        if turns and len(turns) > 0:
+            current_prompt = turns[0].get("user_prompt") or turns[0].get("prompt") or scenario.get("starting_prompt", "")
+        else:
+            current_prompt = scenario.get("starting_prompt", "")
+
         env = scenario.get("env", {})
-        max_turns = scenario.get("max_turns", 1)
         conversation_plan = scenario.get("conversation_plan", "")
         conversation_history = []
         accumulated_tools = []
@@ -143,6 +154,9 @@ class AgentEvaluator:
 
         session_id = None
         for turn in range(max_turns):
+            if is_static_replay and turns and turn < len(turns):
+                current_prompt = turns[turn].get("user_prompt") or turns[turn].get("prompt") or current_prompt
+
             logging.info(
                 f"Turn {turn + 1}/{max_turns} - Prompt: {current_prompt}")
             if isinstance(self.generator, AgentCliGenerator):
@@ -191,8 +205,11 @@ class AgentEvaluator:
                 "agent": result.stdout
             })
 
+            # Next turn determination: static replay vs simulated user
             if turn < max_turns - 1:
-                if simulated_user:
+                if is_static_replay and turns and (turn + 1) < len(turns):
+                    current_prompt = turns[turn + 1].get("user_prompt") or turns[turn + 1].get("prompt") or ""
+                elif simulated_user:
                     next_response = simulated_user.get_next_response(
                         conversation_plan,
                         conversation_history,
@@ -238,6 +255,24 @@ class AgentEvaluator:
         metadata: Dict[str, Any]
     ):
         """Finalizes the scenario by scoring and appending results."""
+        # Standardize conversation_history into role/content structure
+        formatted_history = []
+        for item in conversation_history:
+            if isinstance(item, dict):
+                if "role" in item and "content" in item:
+                    formatted_history.append(item)
+                else:
+                    if "user" in item:
+                        formatted_history.append({"role": "user", "content": str(item["user"])})
+                    if "agent" in item:
+                        formatted_history.append({"role": "assistant", "content": str(item["agent"])})
+
+        if not formatted_history:
+            formatted_history = [
+                {"role": "user", "content": scenario.get("starting_prompt", "")},
+                {"role": "assistant", "content": last_result.stdout if hasattr(last_result, "stdout") else str(last_result)}
+            ]
+
         # Prepare intermediate eval_output with all necessary data for scoring
         eval_output_data = {
             "eval_id": scenario["id"],
@@ -249,8 +284,8 @@ class AgentEvaluator:
             "sql_generator_error": None,
             "golden_error": None,
             "generated_sql": "skipped",
-            "prompt": scenario["starting_prompt"],
-            "conversation_history": json.dumps(conversation_history, indent=2),
+            "prompt": scenario.get("starting_prompt", ""),
+            "conversation_history": json.dumps(formatted_history, indent=2),
             "scenario": scenario,
             "accumulated_tools": accumulated_tools,
             "accumulated_skills": accumulated_skills,
