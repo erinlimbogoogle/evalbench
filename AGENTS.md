@@ -147,6 +147,19 @@ sequenceDiagram
     end
 ```
 
+### 3. Multi-Turn Conversational Agent Workflow (Macchiato / QueryData / Cortado)
+Evaluates high-velocity conversational database agents connected via gRPC streaming (`eval_service.py` / `eval_orchestrator.py`).
+* **Live BigQuery Execution per Turn**: Executes both candidate and golden SQL queries on each turn to run exact row-set equivalence checks via `SetMatcher`.
+* **Dual Rollup Metrics**:
+  * `set_match_all_turns`: Strict trajectory accuracy ($100\%$ iff every turn with SQL succeeds; $0\%$ if any intermediate turn fails).
+  * `set_match_mean`: Average Set Match accuracy across all SQL-bearing turns.
+  * `set_match_turn_N`: Context degradation retention sub-metrics ($\Delta$ drop-off across turns).
+* **Modality Routing**:
+  * **Multi-Turn Drilldowns**: Evaluates per-turn SQL diffing and goal completion.
+  * **Disambiguation**: Turn 1 checks that the agent asks clarification (`generated_sql == ""`); Turn 2 checks post-clarification SQL Set Match.
+  * **Visualization**: Validates underlying aggregate SQL + chart metadata / rubric rating.
+* **Reporting & Mesop Viewer**: `CsvReporter` generates `evals.csv` (with full `conversation_history` & `turn_history`) to power the local Mesop viewer on port `3000` (`http://localhost:3000?job_id=<job_id>`), while `BigQueryReporter` truncates raw table dumps to 2,000 chars to prevent cloud export OOM.
+
 ---
 
 ## Configuration Schemas
