@@ -492,12 +492,18 @@ def _process_results(
     summary_scores_df["job_id"] = job_id
     summary_scores_df["run_time"] = run_time
 
-    # Store the reports in specified outputs
+    # Store the reports in specified outputs with error isolation
     for reporter in reporters:
-        reporter.store(config_df, report.STORETYPE.CONFIGS)
-        reporter.store(results_df, report.STORETYPE.EVALS)
-        reporter.store(scores_df, report.STORETYPE.SCORES)
-        reporter.store(summary_scores_df, report.STORETYPE.SUMMARY)
+        try:
+            reporter.store(config_df, report.STORETYPE.CONFIGS)
+            reporter.store(results_df, report.STORETYPE.EVALS)
+            reporter.store(scores_df, report.STORETYPE.SCORES)
+            reporter.store(summary_scores_df, report.STORETYPE.SUMMARY)
+        except Exception as e:
+            logging.error(
+                f"Reporter {reporter.__class__.__name__} failed: {e}",
+                exc_info=True,
+            )
 
     # k8s emptyDir /tmp does not auto cleanup, so we explicitly delete
     pathlib.Path(results_tf).unlink()

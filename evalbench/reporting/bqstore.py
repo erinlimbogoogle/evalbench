@@ -124,6 +124,11 @@ class BigQueryReporter(Reporter):
             table = self.configs_table
         elif type == STORETYPE.EVALS:
             table = self.results_table
+            # Truncate large raw query result columns to prevent BigQuery Parquet OOM
+            results = results.copy()
+            for col in ["golden_result", "generated_result", "execution_output", "golden_eval_results", "eval_results"]:
+                if col in results.columns:
+                    results[col] = results[col].astype(str).str.slice(0, 2000)
         elif type == STORETYPE.SCORES:
             table = self.scores_table
         elif type == STORETYPE.SUMMARY:
