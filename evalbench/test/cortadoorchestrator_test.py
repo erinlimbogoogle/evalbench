@@ -340,6 +340,10 @@ class TestCortadoOrchestrator(unittest.TestCase):
         self.assertEqual(prompts_seen[1], "Can we filter those to just show female users?")
 
         final_output = eval_result.agent_results[0]
+        self.assertEqual(final_output["id"], "seq_564")
+        self.assertEqual(final_output["eval_id"], "seq_564")
+        self.assertEqual(final_output["nl_prompt"], "How many users did we acquire in 2023 by source?")
+        self.assertEqual(final_output["prompt"], "How many users did we acquire in 2023 by source?")
         self.assertEqual(len(final_output["turn_history"]), 2)
         self.assertEqual(final_output["turn_history"][0]["set_match"], 100.0)
         self.assertEqual(final_output["turn_history"][1]["set_match"], 100.0)

@@ -273,9 +273,33 @@ class AgentEvaluator:
                 {"role": "assistant", "content": last_result.stdout if hasattr(last_result, "stdout") else str(last_result)}
             ]
 
+        # Extract prompt with fallbacks
+        prompt_text = (
+            scenario.get("starting_prompt")
+            or scenario.get("nl_prompt")
+            or (
+                scenario.get("turns", [{}])[0].get("user_prompt")
+                if scenario.get("turns")
+                else ""
+            )
+            or ""
+        )
+
+        # Extract scenario ID with fallbacks
+        scenario_id = (
+            scenario.get("id")
+            or scenario.get("eval_id")
+            or scenario.get("conversation_id")
+            or scenario.get("user_turn_sequence_id")
+            or ""
+        )
+
         # Prepare intermediate eval_output with all necessary data for scoring
         eval_output_data = {
-            "eval_id": scenario["id"],
+            "id": scenario_id,
+            "eval_id": scenario_id,
+            "nl_prompt": prompt_text,
+            "prompt": prompt_text,
             "stdout": last_result.stdout,
             "stderr": last_result.stderr,
             "returncode": last_result.returncode,
@@ -284,7 +308,6 @@ class AgentEvaluator:
             "sql_generator_error": None,
             "golden_error": None,
             "generated_sql": "skipped",
-            "prompt": scenario.get("starting_prompt", ""),
             "conversation_history": json.dumps(formatted_history, indent=2),
             "scenario": scenario,
             "accumulated_tools": accumulated_tools,

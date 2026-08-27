@@ -467,8 +467,32 @@ class CortadoEvaluator:
                 {"role": "assistant", "content": last_response}
             ]
 
+        # Extract prompt with fallbacks
+        prompt_text = (
+            scenario.get("starting_prompt")
+            or scenario.get("nl_prompt")
+            or (
+                scenario.get("turns", [{}])[0].get("user_prompt")
+                if scenario.get("turns")
+                else ""
+            )
+            or ""
+        )
+
+        # Extract scenario ID with fallbacks
+        scenario_id = (
+            scenario.get("id")
+            or scenario.get("eval_id")
+            or scenario.get("conversation_id")
+            or scenario.get("user_turn_sequence_id")
+            or ""
+        )
+
         eval_output_data = {
-            "eval_id": scenario["id"],
+            "id": scenario_id,
+            "eval_id": scenario_id,
+            "nl_prompt": prompt_text,
+            "prompt": prompt_text,
             "stdout": last_response,  # This is the text seen by the simulated user
             "stderr": "",
             "returncode": 0 if not last_response.startswith("Error") else 1,
@@ -480,7 +504,6 @@ class CortadoEvaluator:
             "golden_sql": last_golden_sql,
             "generated_result": last_gen_res if last_gen_res is not None else accumulated_tools,
             "golden_result": last_golden_res if last_golden_res is not None else scenario.get("expected_trajectory", []),
-            "prompt": scenario.get("starting_prompt", ""),
             "conversation_history": json.dumps(formatted_history, indent=2),
             "turn_history": turn_history or [],
             "scenario": scenario,
