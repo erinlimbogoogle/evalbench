@@ -217,12 +217,55 @@ class TestCortadoOrchestrator(unittest.TestCase):
         self.assertEqual(scoring_item["generated_result"], [{"val": 2}])
         self.assertEqual(scoring_item["accumulated_tools"], ["dataplex_search", "query_data_tool"])
 
-        # Check multi-turn dual rollup metrics in scoring_results
+        # Check multi-turn dual rollup metrics and composite score in scoring_results
         comparators = {r["comparator"]: r["score"] for r in scoring_results}
         self.assertIn("set_match_all_turns", comparators)
         self.assertIn("set_match_mean", comparators)
         self.assertIn("set_match_turn_1", comparators)
         self.assertIn("set_match_turn_2", comparators)
+        self.assertIn("composite_score", comparators)
+
+    @patch("scorers.llmrater.get_generator")
+    def test_llmrater_disambiguation_scoring(self, mock_get_generator):
+        from scorers.llmrater import LLMRater
+        mock_model = MagicMock()
+        mock_model.generate.return_value = "PASS -- The agent correctly asked for clarification."
+        mock_get_generator.return_value = mock_model
+
+        rater = LLMRater({"model_config": "fake_model", "prompt_template": "brewmax"}, global_models={})
+
+        # Test 1: Ambiguous prompt with clarification question -> PASS (100%)
+        score, response = rater.compare(
+            nl_prompt="Show revenue for Springfield",
+            golden_query="",
+            query_type="disambiguation",
+            golden_execution_result=[],
+            golden_eval_result="",
+            golden_error="",
+            generated_query="Which Springfield do you mean (Illinois, Missouri, or Massachusetts)?",
+            generated_execution_result=[],
+            generated_eval_result={"agent_text": "Which Springfield do you mean?"},
+            generated_error="",
+            is_ambiguous=True,
+        )
+        self.assertEqual(score, 100.0)
+
+        # Test 2: Ambiguous prompt with blind SQL -> FAIL (0%)
+        score_fail, response_fail = rater.compare(
+            nl_prompt="Show revenue for Springfield",
+            golden_query="",
+            query_type="disambiguation",
+            golden_execution_result=[],
+            golden_eval_result="",
+            golden_error="",
+            generated_query="SELECT sum(revenue) FROM districts WHERE city='Springfield';",
+            generated_execution_result=[{"rev": 100}],
+            generated_eval_result={"agent_text": "Here is the revenue."},
+            generated_error="",
+            is_ambiguous=True,
+        )
+        self.assertEqual(score_fail, 0.0)
+        self.assertIn("blind SQL", response_fail)
 
 
 if __name__ == "__main__":

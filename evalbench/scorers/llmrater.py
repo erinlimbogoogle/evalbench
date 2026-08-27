@@ -150,6 +150,15 @@ FINAL ANSWER: Choose ONLY ONE
 """
 
 
+import json
+from scorers.prompt.brewmax_rubric import (
+    BREWMAX_DATA_COMPARISON_PROMPT,
+    BREWMAX_SQL_LOGIC_COMPARISON_PROMPT,
+    BREWMAX_ERROR_CATEGORIZATION_PROMPT,
+    BREWMAX_DISAMBIGUATION_PROMPT,
+)
+
+
 class LLMRater(comparator.Comparator):
     """
     LLMRater class implements the Comparator base class.
@@ -161,6 +170,8 @@ class LLMRater(comparator.Comparator):
 
     def __init__(self, config: dict, global_models):
         self.name = "llmrater"
+        self.config = config or {}
+        self.prompt_template = self.config.get("prompt_template", "default").lower()
         self.set_match_checker = setmatcher.SetMatcher({})
         self.cache_client = get_cache_client(config)
         self.model_config = config.get("model_config") or ""
@@ -247,6 +258,55 @@ class LLMRater(comparator.Comparator):
         database: str = "",
         **kwargs,
     ) -> Tuple[float, str]:
+        # Handle Disambiguation queries (ambiguous prompts where ground truth expects clarification)
+        is_ambiguous = (
+            kwargs.get("is_ambiguous", False)
+            or (query_type and "disambig" in str(query_type).lower())
+            or (not golden_query and not golden_execution_result and "disambig" in str(kwargs.get("id", "")).lower())
+        )
+
+        if is_ambiguous:
+            # Extract agent text / conversational response
+            agent_response = ""
+            if isinstance(generated_eval_result, dict):
+                agent_response = generated_eval_result.get("agent_text") or generated_eval_result.get("generated_nl_response", "")
+            elif isinstance(generated_eval_result, str) and generated_eval_result:
+                try:
+                    parsed = json.loads(generated_eval_result)
+                    if isinstance(parsed, dict):
+                        agent_response = parsed.get("agent_text") or parsed.get("generated_nl_response", "")
+                except Exception:
+                    agent_response = generated_eval_result
+
+            if not agent_response and generated_query and generated_query != "skipped":
+                agent_response = generated_query
+
+            # If agent executed blind SQL without asking clarification, fail immediately
+            if (
+                generated_query
+                and generated_query.strip().upper().startswith(("SELECT", "WITH", "CREATE", "INSERT"))
+                and not generated_error
+            ):
+                return 0.0, "FAIL: Agent executed blind SQL on an ambiguous prompt instead of asking for clarification."
+
+            prompt = BREWMAX_DISAMBIGUATION_PROMPT.format(
+                nl_prompt=nl_prompt,
+                agent_response=agent_response if agent_response else "No response",
+            )
+            if self.cache_client:
+                response = with_cache_execute(
+                    prompt,
+                    self.model_config,
+                    self._inference_without_caching,
+                    self.cache_client,
+                )
+            else:
+                response = self._inference_without_caching(prompt)
+
+            first_line = response.strip().split("\n")[0].upper()
+            score = 100.0 if ("PASS" in first_line or "PASS" in response.upper()) and "FAIL" not in first_line else 0.0
+            return score, response
+
         is_empty_results = len(golden_execution_result) == 0 and len(generated_execution_result) == 0
 
         if not is_empty_results and self._is_exact_match(
@@ -292,14 +352,18 @@ class LLMRater(comparator.Comparator):
             generated_execution_result, only_first_n
         )
 
+        is_brewmax = self.prompt_template == "brewmax"
+
         if is_empty_results:
-            prompt = SQL_LOGIC_COMPARISON_PROMPT.format(
+            template = BREWMAX_SQL_LOGIC_COMPARISON_PROMPT if is_brewmax else SQL_LOGIC_COMPARISON_PROMPT
+            prompt = template.format(
                 nl_prompt=nl_prompt,
                 golden_sql=golden_query,
                 generated_sql=generated_query,
             )
         else:
-            prompt = DATA_COMPARISON_PROMPT.format(
+            template = BREWMAX_DATA_COMPARISON_PROMPT if is_brewmax else DATA_COMPARISON_PROMPT
+            prompt = template.format(
                 nl_prompt=nl_prompt,
                 golden_execution_result=golden_execution_result,
                 generated_execution_result=generated_execution_result,
@@ -331,7 +395,8 @@ class LLMRater(comparator.Comparator):
             )
 
         if score == 0:
-            prompt = ERROR_CATEGORIZATION_PROMPT.format(
+            err_template = BREWMAX_ERROR_CATEGORIZATION_PROMPT if is_brewmax else ERROR_CATEGORIZATION_PROMPT
+            prompt = err_template.format(
                 nl_prompt=nl_prompt,
                 golden_sql=golden_query,
                 golden_execution_result=golden_execution_result,

@@ -86,6 +86,17 @@ class AgentScoreWork(Work):
             global_models=self.global_models
         )
 
+        base_item = {
+            "id": self.eval_output.get("eval_id"),
+            "generated_sql": generated_sql if generated_sql else "skipped",
+            "generated_error": self.eval_output.get("generated_error"),
+            "dialects": metadata.get("dialects", []),
+            "database": metadata.get("database", "unknown"),
+            "job_id": self.eval_output.get("job_id"),
+            "comparison_logs": None,
+            "comparison_error": None,
+        }
+
         # Multi-turn rollup metrics calculation
         if turn_history:
             sql_turns = [t for t in turn_history if t.get("golden_sql") or t.get("generated_sql")]
@@ -93,17 +104,6 @@ class AgentScoreWork(Work):
                 set_match_scores = [t.get("set_match", 0.0) for t in sql_turns]
                 all_turns_score = 100.0 if all(s == 100.0 for s in set_match_scores) else 0.0
                 mean_score = sum(set_match_scores) / len(set_match_scores)
-
-                base_item = {
-                    "id": self.eval_output.get("eval_id"),
-                    "generated_sql": generated_sql if generated_sql else "skipped",
-                    "generated_error": self.eval_output.get("generated_error"),
-                    "dialects": metadata.get("dialects", []),
-                    "database": metadata.get("database", "unknown"),
-                    "job_id": self.eval_output.get("job_id"),
-                    "comparison_logs": None,
-                    "comparison_error": None,
-                }
 
                 # Record multi-turn aggregate metrics
                 self.scoring_results.append({
@@ -124,5 +124,39 @@ class AgentScoreWork(Work):
                             "comparator": f"set_match_turn_{t_idx + 1}",
                             "score": float(t["set_match"]),
                         })
+
+        # Calculate 3-Tier Composite Score for Brewmax Parity:
+        # Composite = 0.90 * Content + 0.05 * Conciseness + 0.05 * BestPractices
+        eval_id = self.eval_output.get("eval_id")
+        current_scores = [r for r in self.scoring_results if r.get("id") == eval_id]
+        content_score = 0.0
+        for comp_name in ["llmrater", "goal_completion", "set_match_all_turns", "set_match"]:
+            found = False
+            for r in current_scores:
+                if r.get("comparator") == comp_name and r.get("score") is not None:
+                    content_score = float(r["score"])
+                    found = True
+                    break
+            if found:
+                break
+
+        accumulated_tools = self.eval_output.get("accumulated_tools", [])
+        tool_counts = {}
+        for t in accumulated_tools:
+            tool_counts[t] = tool_counts.get(t, 0) + 1
+        has_excessive_duplicates = any(c > 4 for c in tool_counts.values())
+        conciseness_score = 50.0 if has_excessive_duplicates else 100.0
+        best_practices_score = 100.0
+
+        composite_score = round(
+            0.90 * content_score + 0.05 * conciseness_score + 0.05 * best_practices_score, 2
+        )
+
+        self.scoring_results.append({
+            **base_item,
+            "comparator": "composite_score",
+            "score": composite_score,
+            "comparison_logs": f"Content={content_score} (0.90), Conciseness={conciseness_score} (0.05), BestPractices={best_practices_score} (0.05)",
+        })
 
         return self.eval_output
