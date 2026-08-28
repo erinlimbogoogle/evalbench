@@ -59,9 +59,12 @@ class AgentScoreWork(Work):
         if generated_result is None:
             generated_result = self.eval_output.get("accumulated_tools", [])
 
+        item_id = self.eval_output.get("id") or self.eval_output.get("eval_id") or ""
+        item_prompt = self.eval_output.get("nl_prompt") or self.eval_output.get("prompt") or scenario.get("starting_prompt", "")
+
         scoring_item = {
-            "id": self.eval_output.get("eval_id"),
-            "nl_prompt": scenario.get("starting_prompt", ""),
+            "id": item_id,
+            "nl_prompt": item_prompt,
             "golden_sql": golden_sql,
             "query_type": "dql",
             "golden_result": golden_result,
@@ -87,7 +90,7 @@ class AgentScoreWork(Work):
         )
 
         base_item = {
-            "id": self.eval_output.get("eval_id"),
+            "id": item_id,
             "generated_sql": generated_sql if generated_sql else "skipped",
             "generated_error": self.eval_output.get("generated_error"),
             "dialects": metadata.get("dialects", []),
