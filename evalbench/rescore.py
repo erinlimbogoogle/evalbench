@@ -49,6 +49,62 @@ def _safe_parse(val: Any, default: Any = None) -> Any:
     return val_str
 
 
+def _extract_telemetry_sql(row: dict, scenario: dict, turn_history: list) -> str:
+    """Extracts SQL from internal telemetry/actions when top-level generated_sql is blank."""
+    # 1. Check turn history
+    if turn_history:
+        for t in reversed(turn_history):
+            if isinstance(t, dict):
+                sql = t.get("generated_sql") or t.get("sql") or t.get("query")
+                if sql and isinstance(sql, str) and sql.strip() and sql.strip() != "skipped":
+                    return sql.strip()
+
+    # 2. Check sources for actions/telemetry
+    sources = [
+        row.get("macchiato_debug_info"),
+        row.get("debug_info"),
+        row.get("other"),
+        scenario.get("other"),
+        scenario.get("macchiato_debug_info"),
+    ]
+
+    def _find_sql_in_obj(obj: Any) -> Optional[str]:
+        if not obj:
+            return None
+        parsed = _safe_parse(obj)
+        if isinstance(parsed, dict):
+            for k in ("sql", "query", "sql_query", "executed_sql"):
+                if k in parsed and isinstance(parsed[k], str) and parsed[k].strip():
+                    return parsed[k].strip()
+            if "input" in parsed and isinstance(parsed["input"], dict):
+                for k in ("sql", "query", "sql_query"):
+                    if k in parsed["input"] and isinstance(parsed["input"][k], str) and parsed["input"][k].strip():
+                        return parsed["input"][k].strip()
+            for list_k in ("actions", "tool_calls", "tools"):
+                if list_k in parsed:
+                    res = _find_sql_in_obj(parsed[list_k])
+                    if res:
+                        return res
+            for k, v in parsed.items():
+                if isinstance(v, (dict, list)):
+                    res = _find_sql_in_obj(v)
+                    if res:
+                        return res
+        elif isinstance(parsed, list):
+            for item in reversed(parsed):
+                res = _find_sql_in_obj(item)
+                if res:
+                    return res
+        return None
+
+    for src in sources:
+        found_sql = _find_sql_in_obj(src)
+        if found_sql:
+            return found_sql
+
+    return ""
+
+
 def _row_to_eval_output(row: dict) -> dict:
     """Converts a row from evals.csv / results.json into an eval_output dictionary."""
     scenario = _safe_parse(row.get("scenario"), {})
@@ -77,6 +133,12 @@ def _row_to_eval_output(row: dict) -> dict:
         or ""
     )
 
+    generated_sql = str(row.get("generated_sql") or "").strip()
+    if not generated_sql or generated_sql == "skipped":
+        telemetry_sql = _extract_telemetry_sql(row, scenario, turn_history if isinstance(turn_history, list) else [])
+        if telemetry_sql:
+            generated_sql = telemetry_sql
+
     generated_result = _safe_parse(row.get("generated_result"))
     golden_result = _safe_parse(row.get("golden_result"))
 
@@ -92,7 +154,7 @@ def _row_to_eval_output(row: dict) -> dict:
         "generated_error": str(row.get("generated_error")) if pd.notna(row.get("generated_error")) and str(row.get("generated_error")).strip() != "" else None,
         "sql_generator_error": row.get("sql_generator_error") if pd.notna(row.get("sql_generator_error")) else None,
         "golden_error": str(row.get("golden_error")) if pd.notna(row.get("golden_error")) and str(row.get("golden_error")).strip() != "" else None,
-        "generated_sql": str(row.get("generated_sql") or "skipped"),
+        "generated_sql": generated_sql if generated_sql else "skipped",
         "golden_sql": str(row.get("golden_sql") or ""),
         "generated_result": generated_result if generated_result is not None else accumulated_tools,
         "golden_result": golden_result if golden_result is not None else scenario.get("expected_trajectory", []),

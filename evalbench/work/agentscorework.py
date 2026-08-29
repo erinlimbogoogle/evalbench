@@ -62,11 +62,18 @@ class AgentScoreWork(Work):
         item_id = self.eval_output.get("id") or self.eval_output.get("eval_id") or ""
         item_prompt = self.eval_output.get("nl_prompt") or self.eval_output.get("prompt") or scenario.get("starting_prompt", "")
 
+        is_ambiguous = bool(
+            scenario.get("is_ambiguous", False)
+            or self.eval_output.get("is_ambiguous", False)
+            or (not golden_sql and not golden_result)
+        )
+
         scoring_item = {
             "id": item_id,
             "nl_prompt": item_prompt,
             "golden_sql": golden_sql,
-            "query_type": "dql",
+            "query_type": "disambiguation" if is_ambiguous else "dql",
+            "is_ambiguous": is_ambiguous,
             "golden_result": golden_result,
             "golden_eval_results": "",
             "golden_error": self.eval_output.get("golden_error", ""),
