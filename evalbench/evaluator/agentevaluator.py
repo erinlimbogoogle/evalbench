@@ -90,13 +90,24 @@ class AgentEvaluator:
             )
             self.agentrunner.execute_work(work)
 
-        for future in concurrent.futures.as_completed(self.agentrunner.futures):
-            item = future.result()
+        total_items = len(dataset)
+        completed_items = 0
+        logging.info(f"Dispatched {total_items} scenarios to agent runners. Processing...")
 
-            if hasattr(item, "agent_results"):
-                eval_outputs.extend(item.agent_results)
-            if hasattr(item, "scoring_results"):
-                scoring_results.extend(item.scoring_results)
+        for future in concurrent.futures.as_completed(self.agentrunner.futures):
+            try:
+                item = future.result()
+                if hasattr(item, "agent_results"):
+                    eval_outputs.extend(item.agent_results)
+                if hasattr(item, "scoring_results"):
+                    scoring_results.extend(item.scoring_results)
+            except Exception as e:
+                logging.error(f"Error getting result from future: {e}", exc_info=True)
+
+            completed_items += 1
+            if completed_items % 5 == 0 or completed_items == total_items:
+                pct = (completed_items / total_items) * 100 if total_items else 0
+                logging.info(f"Progress: [{completed_items}/{total_items}] scenarios completed ({pct:.1f}%)")
 
         return eval_outputs, scoring_results
 

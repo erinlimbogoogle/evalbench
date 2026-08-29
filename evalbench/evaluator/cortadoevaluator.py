@@ -247,6 +247,10 @@ class CortadoEvaluator:
             )
             self.agentrunner.execute_work(work)
 
+        total_items = len(dataset)
+        completed_items = 0
+        logging.info(f"Dispatched {total_items} scenarios to workers. Processing...")
+
         for future in concurrent.futures.as_completed(self.agentrunner.futures):
             try:
                 # This now contains the returned object from process_scenario
@@ -257,6 +261,11 @@ class CortadoEvaluator:
                     scoring_results.extend(modified_item.scoring_results)
             except Exception as e:
                 logging.error(f"Error getting result from future: {e}", exc_info=True)
+
+            completed_items += 1
+            if completed_items % 5 == 0 or completed_items == total_items:
+                pct = (completed_items / total_items) * 100 if total_items else 0
+                logging.info(f"Progress: [{completed_items}/{total_items}] scenarios completed ({pct:.1f}%)")
 
         return eval_outputs, scoring_results
 
