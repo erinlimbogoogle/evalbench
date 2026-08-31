@@ -36,7 +36,10 @@ GRANT USAGE ON SCHEMA public TO {DML_USERNAME};
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {DML_USERNAME};
 """
 
-CONNECTOR = Connector()
+try:
+    CONNECTOR = Connector()
+except Exception:
+    CONNECTOR = None
 
 
 class PGDB(DB):
@@ -66,6 +69,9 @@ class PGDB(DB):
 
         def get_conn():
             # Only used for Cloud SQL Connector path
+            global CONNECTOR
+            if CONNECTOR is None:
+                CONNECTOR = Connector()
             conn = CONNECTOR.connect(
                 self.db_path,
                 "pg8000",

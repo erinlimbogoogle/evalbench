@@ -8,7 +8,15 @@ import unittest
 from unittest.mock import MagicMock, patch
 import pandas as pd
 
-from rescore import _safe_parse, _row_to_eval_output, load_traces, rescore
+import threading
+from rescore import (
+    _safe_parse,
+    _row_to_eval_output,
+    _clean_sql_query,
+    _reexecute_trace_sql,
+    load_traces,
+    rescore,
+)
 
 
 class TestRescore(unittest.TestCase):
@@ -25,6 +33,24 @@ class TestRescore(unittest.TestCase):
         self.assertEqual(_safe_parse('{"a": 1}'), {"a": 1})
         self.assertEqual(_safe_parse("[1, 2, 3]"), [1, 2, 3])
         self.assertEqual(_safe_parse("plain string"), "plain string")
+
+    def test_clean_sql_query(self):
+        self.assertEqual(_clean_sql_query("SELECT 1;"), "SELECT 1;")
+        self.assertEqual(
+            _clean_sql_query("```sql\nSELECT * FROM users;\n```"),
+            "SELECT * FROM users;",
+        )
+        self.assertEqual(
+            _clean_sql_query("```\nSELECT * FROM products;\n```"),
+            "SELECT * FROM products;",
+        )
+        self.assertEqual(
+            _clean_sql_query("-- [Sherlog Trace] telemetry 123\nSELECT id FROM items;"),
+            "SELECT id FROM items;",
+        )
+        self.assertEqual(_clean_sql_query("skipped"), "")
+        self.assertEqual(_clean_sql_query(""), "")
+        self.assertEqual(_clean_sql_query(None), "")
 
     def test_row_to_eval_output(self):
         row = {
@@ -50,10 +76,75 @@ class TestRescore(unittest.TestCase):
         self.assertIsInstance(eval_output["turn_history"], list)
         self.assertEqual(len(eval_output["turn_history"]), 1)
 
+    @patch("databases.get_database")
+    def test_reexecute_trace_sql_multiturn(self, mock_get_db):
+        mock_db = MagicMock()
+        mock_db.execute.return_value = ([{"col": "val"}], None, None)
+        mock_get_db.return_value = mock_db
+
+        eval_output = {
+            "id": "scenario_mt",
+            "eval_id": "scenario_mt",
+            "database": "test_db",
+            "generated_sql": "```sql\nSELECT 1;\n```",
+            "golden_sql": "SELECT 1;",
+            "generated_result": [],
+            "generated_error": "Previous error",
+            "golden_result": [],
+            "turn_history": [
+                {
+                    "turn": 1,
+                    "user_prompt": "Turn 1 prompt",
+                    "generated_sql": "```sql\nSELECT turn1;\n```",
+                    "golden_sql": "SELECT turn1;",
+                    "generated_execution_result": [],
+                    "golden_execution_result": [],
+                    "set_match": 0.0,
+                }
+            ],
+            "metadata": {},
+            "scenario": {},
+        }
+
+        mock_set_matcher = MagicMock()
+        mock_set_matcher.compare.return_value = (100.0, "")
+
+        db_cache = {}
+        db_lock = threading.Lock()
+        _reexecute_trace_sql(
+            eval_output=eval_output,
+            db_configs={},
+            db_cache=db_cache,
+            db_lock=db_lock,
+            set_matcher=mock_set_matcher,
+            force=False,
+            only_on_empty=True,
+        )
+
+        self.assertEqual(eval_output["generated_sql"], "SELECT 1;")
+        self.assertEqual(eval_output["generated_result"], [{"col": "val"}])
+        self.assertIsNone(eval_output["generated_error"])
+        self.assertEqual(eval_output["golden_result"], [{"col": "val"}])
+
+        # Verify turn_history refreshed
+        turn_0 = eval_output["turn_history"][0]
+        self.assertEqual(turn_0["generated_sql"], "SELECT turn1;")
+        self.assertEqual(turn_0["generated_execution_result"], [{"col": "val"}])
+        self.assertEqual(turn_0["golden_execution_result"], [{"col": "val"}])
+        self.assertEqual(turn_0["set_match"], 100.0)
+
+    @patch("databases.get_database")
     @patch("rescore.load_yaml_config")
     @patch("rescore.load_session_configs")
     @patch("rescore.AgentScoreWork")
-    def test_rescore_end_to_end(self, mock_score_work_cls, mock_load_session, mock_load_yaml):
+    def test_rescore_end_to_end_with_reexecute(
+        self, mock_score_work_cls, mock_load_session, mock_load_yaml, mock_get_db
+    ):
+        # Setup mock DB
+        mock_db = MagicMock()
+        mock_db.execute.return_value = ([{"count": 42}], None, None)
+        mock_get_db.return_value = mock_db
+
         # Setup mock configs
         mock_load_yaml.return_value = {
             "scorers": {"llmrater": {}, "set_match": {}},
@@ -82,7 +173,7 @@ class TestRescore(unittest.TestCase):
         mock_work_instance.run.side_effect = lambda: fake_run(mock_work_instance)
         mock_score_work_cls.side_effect = lambda **kwargs: _create_mock_work(kwargs, fake_run)
 
-        # Create dummy evals.csv
+        # Create dummy evals.csv with empty generated_result
         csv_path = os.path.join(self.test_dir, "evals.csv")
         df = pd.DataFrame([
             {
@@ -90,16 +181,8 @@ class TestRescore(unittest.TestCase):
                 "nl_prompt": "Test query 1",
                 "generated_sql": "SELECT 1;",
                 "golden_sql": "SELECT 1;",
-                "generated_result": "[{\"col\": 1}]",
-                "golden_result": "[{\"col\": 1}]",
-            },
-            {
-                "id": "s2",
-                "nl_prompt": "Test query 2",
-                "generated_sql": "SELECT 2;",
-                "golden_sql": "SELECT 2;",
-                "generated_result": "[{\"col\": 2}]",
-                "golden_result": "[{\"col\": 2}]",
+                "generated_result": "[]",
+                "golden_result": "[]",
             }
         ])
         df.to_csv(csv_path, index=False)
@@ -110,10 +193,13 @@ class TestRescore(unittest.TestCase):
             config_file="dummy_config.yaml",
             output_dir=out_dir,
             workers=2,
+            reexecute_on_empty=True,
+            save_refreshed_evals=True,
         )
 
         self.assertTrue(os.path.exists(os.path.join(out_dir, "scores.csv")))
         self.assertTrue(os.path.exists(os.path.join(out_dir, "summary.csv")))
+        self.assertTrue(os.path.exists(os.path.join(out_dir, "evals_refreshed.csv")))
         self.assertFalse(summary_df.empty)
 
 

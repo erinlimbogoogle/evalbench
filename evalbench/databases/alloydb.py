@@ -6,7 +6,10 @@ from sqlalchemy.pool import NullPool
 from google.cloud.alloydb.connector import Connector as AlloyDBConnector
 from google.cloud.alloydb.connector import IPTypes as AlloyDBIPTypes
 
-CONNECTOR = AlloyDBConnector()
+try:
+    CONNECTOR = AlloyDBConnector()
+except Exception:
+    CONNECTOR = None
 
 
 class AlloyDB(PGDB):
@@ -22,6 +25,9 @@ class AlloyDB(PGDB):
             CONNECTOR._alloydb_api_endpoint = db_config['api_endpoint']
 
         def get_conn_alloydb():
+            global CONNECTOR
+            if CONNECTOR is None:
+                CONNECTOR = AlloyDBConnector()
             return CONNECTOR.connect(
                 self.db_path,
                 "pg8000",

@@ -1,8 +1,13 @@
 """Cloud Dataform Scorers using Google Cloud Dataform API."""
 
 import time
-from typing import Tuple, List, Any
-from google.cloud import dataform_v1beta1
+try:
+    from google.cloud import dataform_v1beta1
+except (ImportError, AttributeError):
+    try:
+        from google.cloud import dataform as dataform_v1beta1
+    except (ImportError, AttributeError):
+        dataform_v1beta1 = None
 import google.auth
 from google.api_core import exceptions as api_exceptions
 from scorers import comparator

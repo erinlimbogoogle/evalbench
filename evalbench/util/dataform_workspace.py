@@ -8,7 +8,13 @@ import re
 import zipfile
 
 from google.api_core import exceptions as api_exceptions
-from google.cloud import dataform_v1beta1
+try:
+    from google.cloud import dataform_v1beta1
+except (ImportError, AttributeError):
+    try:
+        from google.cloud import dataform as dataform_v1beta1
+    except (ImportError, AttributeError):
+        dataform_v1beta1 = None
 
 logger = logging.getLogger(__name__)
 

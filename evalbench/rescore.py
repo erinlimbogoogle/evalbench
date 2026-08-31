@@ -11,13 +11,16 @@ import datetime
 import json
 import logging
 import os
+import re
 import sys
 import threading
 from typing import Any, Dict, List, Optional
 import pandas as pd
 
+import databases
 from reporting import analyzer
 from reporting.report import STORETYPE
+from scorers.setmatcher import SetMatcher
 from util.config import load_yaml_config, set_session_configs
 from util.service import load_session_configs
 from work.agentscorework import AgentScoreWork
@@ -103,6 +106,213 @@ def _extract_telemetry_sql(row: dict, scenario: dict, turn_history: list) -> str
             return found_sql
 
     return ""
+
+
+def _clean_sql_query(query: str) -> str:
+    """Strips markdown code blocks, Sherlog trace headers, and surrounding whitespace."""
+    if not query or not isinstance(query, str):
+        return ""
+    q = query.strip()
+    if not q or q.lower() == "skipped":
+        return ""
+
+    # 1. Strip markdown code fences (e.g. ```sql ... ``` or ``` ...)
+    fence_pattern = re.compile(r"```(?:sql)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
+    match = fence_pattern.search(q)
+    if match:
+        q = match.group(1).strip()
+    elif q.startswith("```"):
+        q = re.sub(r"^```(?:sql)?\s*", "", q, flags=re.IGNORECASE)
+        q = re.sub(r"\s*```$", "", q)
+        q = q.strip()
+
+    # 2. Strip leading comments or trace annotations (e.g. -- [Sherlog Trace] or multiple comment lines)
+    lines = q.splitlines()
+    cleaned_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("-- [Sherlog Trace]") or stripped.startswith("-- [Telemetry]"):
+            continue
+        cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines).strip()
+
+
+def _get_cached_db(
+    database_name: str,
+    dialect: str,
+    db_configs: Any,
+    db_cache: dict,
+    db_lock: threading.Lock,
+) -> Optional[Any]:
+    """Retrieves or creates a thread-safe database connection instance from cache."""
+    cache_key = f"{dialect}_{database_name}"
+    with db_lock:
+        if cache_key in db_cache:
+            return db_cache[cache_key]
+
+        db_cfg = None
+        if isinstance(db_configs, dict):
+            dialect_configs = db_configs.get(dialect)
+            if isinstance(dialect_configs, list) and dialect_configs:
+                db_cfg = dialect_configs[0]
+            elif isinstance(dialect_configs, dict):
+                db_cfg = dialect_configs
+        elif isinstance(db_configs, list) and db_configs:
+            db_cfg = db_configs[0]
+
+        if not db_cfg:
+            db_cfg = {"db_type": dialect or "bigquery"}
+
+        db_cfg_copy = db_cfg.copy() if isinstance(db_cfg, dict) else {"db_type": dialect or "bigquery"}
+        if "db_type" not in db_cfg_copy:
+            db_cfg_copy["db_type"] = dialect or "bigquery"
+
+        try:
+            db = databases.get_database(db_cfg_copy, database_name)
+            db_cache[cache_key] = db
+            return db
+        except Exception as e:
+            logging.warning(
+                f"Could not initialize database '{database_name}' for dialect '{dialect}': {e}"
+            )
+            return None
+
+
+def _reexecute_single_sql(db: Any, sql_query: str) -> tuple[Optional[List[Any]], Optional[str]]:
+    """Executes a single SQL query against db, returning (result_rows, error_str)."""
+    cleaned = _clean_sql_query(sql_query)
+    if not cleaned or cleaned.lower() == "skipped":
+        return None, None
+    try:
+        res, _, err = db.execute(cleaned, use_cache=True, rollback=True)
+        return (res if res is not None else []), (str(err) if err else None)
+    except Exception as e:
+        return [], str(e)
+
+
+def _reexecute_trace_sql(
+    eval_output: dict,
+    db_configs: Any,
+    db_cache: dict,
+    db_lock: threading.Lock,
+    set_matcher: Optional[Any] = None,
+    force: bool = False,
+    only_on_empty: bool = False,
+) -> None:
+    """Re-executes generated and golden SQL against target database and refreshes turn set_match."""
+    metadata = eval_output.get("metadata", {})
+    scenario = eval_output.get("scenario", {})
+    database_name = (
+        eval_output.get("database")
+        or metadata.get("database")
+        or scenario.get("database", "")
+    )
+    dialects = (
+        metadata.get("dialects")
+        or scenario.get("dialects", ["bigquery"])
+    )
+    dialect = dialects[0] if isinstance(dialects, list) and dialects else "bigquery"
+
+    db = _get_cached_db(database_name, dialect, db_configs, db_cache, db_lock)
+    if not db:
+        return
+
+    # 1. Top-Level Generated SQL Re-Execution
+    gen_sql = eval_output.get("generated_sql", "")
+    cleaned_gen_sql = _clean_sql_query(gen_sql)
+    if cleaned_gen_sql:
+        eval_output["generated_sql"] = cleaned_gen_sql
+        should_run_gen = force or (
+            only_on_empty
+            and (
+                eval_output.get("generated_result") is None
+                or eval_output.get("generated_result") == []
+                or eval_output.get("generated_error")
+            )
+        )
+        if should_run_gen:
+            res, err = _reexecute_single_sql(db, cleaned_gen_sql)
+            eval_output["generated_result"] = res if res is not None else []
+            eval_output["generated_error"] = err
+
+    # 2. Top-Level Golden SQL Re-Execution
+    gold_sql = eval_output.get("golden_sql", "")
+    cleaned_gold_sql = _clean_sql_query(gold_sql)
+    if cleaned_gold_sql:
+        eval_output["golden_sql"] = cleaned_gold_sql
+        should_run_gold = force or (
+            only_on_empty
+            and (
+                eval_output.get("golden_result") is None
+                or eval_output.get("golden_result") == []
+                or eval_output.get("golden_error")
+            )
+        )
+        if should_run_gold:
+            res, err = _reexecute_single_sql(db, cleaned_gold_sql)
+            eval_output["golden_result"] = res if res is not None else []
+            eval_output["golden_error"] = err
+
+    # 3. Multi-Turn Trajectory Awareness (turn_history re-execution & set_match refresh)
+    turn_history = eval_output.get("turn_history", [])
+    if isinstance(turn_history, list):
+        for turn_item in turn_history:
+            if not isinstance(turn_item, dict):
+                continue
+            t_gen_sql = _clean_sql_query(turn_item.get("generated_sql") or turn_item.get("sql") or "")
+            t_gold_sql = _clean_sql_query(turn_item.get("golden_sql") or "")
+
+            if t_gen_sql:
+                turn_item["generated_sql"] = t_gen_sql
+                should_run_t_gen = force or (
+                    only_on_empty
+                    and (
+                        turn_item.get("generated_execution_result") is None
+                        or turn_item.get("generated_execution_result") == []
+                        or turn_item.get("generated_error")
+                    )
+                )
+                if should_run_t_gen:
+                    res, err = _reexecute_single_sql(db, t_gen_sql)
+                    turn_item["generated_execution_result"] = res if res is not None else []
+                    turn_item["generated_error"] = err
+
+            if t_gold_sql:
+                turn_item["golden_sql"] = t_gold_sql
+                should_run_t_gold = force or (
+                    only_on_empty
+                    and (
+                        turn_item.get("golden_execution_result") is None
+                        or turn_item.get("golden_execution_result") == []
+                        or turn_item.get("golden_error")
+                    )
+                )
+                if should_run_t_gold:
+                    res, err = _reexecute_single_sql(db, t_gold_sql)
+                    turn_item["golden_execution_result"] = res if res is not None else []
+                    turn_item["golden_error"] = err
+
+            if set_matcher and (t_gen_sql or t_gold_sql):
+                try:
+                    score, _ = set_matcher.compare(
+                        nl_prompt=turn_item.get("user_prompt", ""),
+                        golden_query=t_gold_sql,
+                        query_type="dql",
+                        golden_execution_result=turn_item.get("golden_execution_result") or [],
+                        golden_eval_result="",
+                        golden_error=str(turn_item.get("golden_error") or ""),
+                        generated_query=t_gen_sql,
+                        generated_execution_result=turn_item.get("generated_execution_result") or [],
+                        generated_eval_result="",
+                        generated_error=str(turn_item.get("generated_error") or ""),
+                    )
+                    turn_item["set_match"] = float(score)
+                except Exception as e:
+                    logging.warning(
+                        f"SetMatcher comparison failed on turn {turn_item.get('turn')}: {e}"
+                    )
+                    turn_item["set_match"] = 0.0
 
 
 def _row_to_eval_output(row: dict) -> dict:
@@ -204,6 +414,9 @@ def rescore(
     workers: int = 20,
     scenarios: Optional[List[str]] = None,
     limit: Optional[int] = None,
+    reexecute_sql: bool = False,
+    reexecute_on_empty: bool = False,
+    save_refreshed_evals: bool = False,
 ) -> pd.DataFrame:
     """Executes offline rescoring across all traces in parallel."""
     # 1. Load Configurations
@@ -232,7 +445,47 @@ def rescore(
     job_id = traces[0].get("job_id", "rescored_run")
     run_time = datetime.datetime.now().isoformat()
 
-    # 4. Setup Parallel Rescoring
+    # 4. Optional Database SQL Re-Execution
+    if reexecute_sql or reexecute_on_empty:
+        logging.info(
+            f"Starting database query re-execution (force={reexecute_sql}, only_on_empty={reexecute_on_empty}) across {len(traces)} traces..."
+        )
+        set_matcher_cfg = config.get("scorers", {}).get("set_match", {})
+        set_matcher = SetMatcher(set_matcher_cfg) if set_matcher_cfg is not None else SetMatcher({})
+        db_cache: dict = {}
+        db_lock = threading.Lock()
+
+        db_start_time = datetime.datetime.now()
+        with ThreadPoolExecutor(max_workers=workers) as db_executor:
+            futures = {
+                db_executor.submit(
+                    _reexecute_trace_sql,
+                    trace,
+                    db_configs,
+                    db_cache,
+                    db_lock,
+                    set_matcher,
+                    force=reexecute_sql,
+                    only_on_empty=reexecute_on_empty,
+                ): trace
+                for trace in traces
+            }
+            completed_db = 0
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    trace_id = futures[future].get("id")
+                    logging.error(f"Error re-executing SQL for trace '{trace_id}': {e}", exc_info=True)
+                completed_db += 1
+                if completed_db % 50 == 0 or completed_db == len(traces):
+                    elapsed = (datetime.datetime.now() - db_start_time).total_seconds()
+                    logging.info(f"DB Re-execution Progress: [{completed_db}/{len(traces)}] completed ({elapsed:.1f}s elapsed)")
+
+        db_duration = (datetime.datetime.now() - db_start_time).total_seconds()
+        logging.info(f"Database query re-execution completed in {db_duration:.2f}s.")
+
+    # 5. Setup Parallel Rescoring
     global_models = {
         "lock": threading.Lock(),
         "semaphores": {},
@@ -274,7 +527,7 @@ def rescore(
     duration = (datetime.datetime.now() - start_time).total_seconds()
     logging.info(f"Rescoring finished in {duration:.2f}s ({len(all_scores)} score records generated).")
 
-    # 5. Analyze Results
+    # 6. Analyze Results
     scores_df, summary_scores_df = analyzer.analyze_result(
         scores=all_scores,
         experiment_config=config,
@@ -284,7 +537,7 @@ def rescore(
     summary_scores_df["job_id"] = job_id
     summary_scores_df["run_time"] = run_time
 
-    # 6. Save Artifacts
+    # 7. Save Artifacts
     if not output_dir:
         base_dir = os.path.dirname(os.path.abspath(results_file))
         output_dir = os.path.join(base_dir, "rescored")
@@ -298,7 +551,20 @@ def rescore(
     logging.info(f"Saved rescored scores to: {scores_csv_path}")
     logging.info(f"Saved rescored summary to: {summary_csv_path}")
 
-    # 7. Print Terminal Scorecard Table
+    if save_refreshed_evals or reexecute_sql or reexecute_on_empty:
+        refreshed_rows = []
+        for t in traces:
+            row_dict = dict(t)
+            for k in ("turn_history", "scenario", "metadata", "generated_result", "golden_result", "accumulated_tools", "accumulated_skills"):
+                if isinstance(row_dict.get(k), (dict, list)):
+                    row_dict[k] = json.dumps(row_dict[k])
+            refreshed_rows.append(row_dict)
+        refreshed_df = pd.DataFrame(refreshed_rows)
+        refreshed_csv_path = os.path.join(output_dir, "evals_refreshed.csv")
+        refreshed_df.to_csv(refreshed_csv_path, index=False)
+        logging.info(f"Saved refreshed execution traces to: {refreshed_csv_path}")
+
+    # 8. Print Terminal Scorecard Table
     print("\n" + "=" * 65)
     print(f"       EVALBENCH OFFLINE RESCORE SCORECARD (N={len(traces)})")
     print("=" * 65)
@@ -360,6 +626,25 @@ def main():
         default=None,
         help="Optional limit on number of scenarios to rescore.",
     )
+    parser.add_argument(
+        "--reexecute_sql",
+        "-x",
+        action="store_true",
+        default=False,
+        help="Force re-execute all generated and golden SQL queries against target database before scoring.",
+    )
+    parser.add_argument(
+        "--reexecute_on_empty",
+        action="store_true",
+        default=False,
+        help="Re-execute SQL queries against target database only where execution results are empty or have errors.",
+    )
+    parser.add_argument(
+        "--save_refreshed_evals",
+        action="store_true",
+        default=False,
+        help="Save refreshed execution traces and turn histories to evals_refreshed.csv in output directory.",
+    )
 
     args = parser.parse_args()
     rescore(
@@ -369,6 +654,9 @@ def main():
         workers=args.workers,
         scenarios=args.scenarios,
         limit=args.limit,
+        reexecute_sql=args.reexecute_sql,
+        reexecute_on_empty=args.reexecute_on_empty,
+        save_refreshed_evals=args.save_refreshed_evals,
     )
 
 
