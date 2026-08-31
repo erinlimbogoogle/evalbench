@@ -1,6 +1,7 @@
 """Cloud Dataform Scorers using Google Cloud Dataform API."""
 
 import time
+from typing import Any, List, Optional, Tuple
 try:
     from google.cloud import dataform_v1beta1
 except (ImportError, AttributeError):
