@@ -267,6 +267,64 @@ class TestCortadoOrchestrator(unittest.TestCase):
         self.assertEqual(score_fail, 0.0)
         self.assertIn("blind SQL", response_fail)
 
+        # Test 3: Unambiguous prompt with unnecessary clarification question -> FAIL (0%)
+        score_unambig_fail, response_unambig_fail = rater.compare(
+            nl_prompt="List all orders in 2023",
+            golden_query="SELECT * FROM orders WHERE year = 2023;",
+            query_type="dql",
+            golden_execution_result=[{"order_id": 1}],
+            golden_eval_result="",
+            golden_error="",
+            generated_query="skipped",
+            generated_execution_result=[],
+            generated_eval_result={"generated_disambiguation_question": "What kind of orders do you mean?"},
+            generated_error="",
+            generated_disambiguation_question="What kind of orders do you mean?",
+            is_ambiguous=False,
+        )
+        self.assertEqual(score_unambig_fail, 0.0)
+        self.assertIn("unnecessary clarification", response_unambig_fail)
+
+    def test_group_dataset_by_conversation(self):
+        from evaluator.cortadoevaluator import _group_dataset_by_conversation
+        from dataset.cortadoinput import EvalCortadoRequest
+
+        # 3 flat requests sharing conversation_id conv_999
+        flat_dataset = [
+            EvalCortadoRequest(raw_dict={
+                "id": "t2",
+                "conversation_id": "conv_999",
+                "turn_id": 2,
+                "user_prompt": "Filter by Illinois",
+                "golden_sql": "SELECT * FROM orders WHERE state='IL';"
+            }),
+            EvalCortadoRequest(raw_dict={
+                "id": "t1",
+                "conversation_id": "conv_999",
+                "turn_id": 1,
+                "user_prompt": "Show all orders",
+                "golden_sql": "SELECT * FROM orders;"
+            }),
+            EvalCortadoRequest(raw_dict={
+                "id": "single_turn_01",
+                "conversation_id": "conv_independent",
+                "turn_id": 1,
+                "user_prompt": "Show products",
+                "golden_sql": "SELECT * FROM products;"
+            }),
+        ]
+
+        grouped = _group_dataset_by_conversation(flat_dataset)
+        self.assertEqual(len(grouped), 2)  # conv_999 + conv_independent
+
+        conv_999_item = next(it for it in grouped if it.conversation_id == "conv_999")
+        turns = conv_999_item.raw_dict.get("turns", [])
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0]["turn"], 1)
+        self.assertEqual(turns[0]["user_prompt"], "Show all orders")
+        self.assertEqual(turns[1]["turn"], 2)
+        self.assertEqual(turns[1]["user_prompt"], "Filter by Illinois")
+
     @patch("evaluator.cortadoevaluator.databases.get_database")
     @patch("evaluator.cortadoevaluator.GrpcProxyModel")
     def test_cortado_evaluator_deterministic_static_replay(self, mock_grpc_model, mock_get_database):

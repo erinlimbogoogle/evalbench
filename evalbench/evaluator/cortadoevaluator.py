@@ -1,6 +1,7 @@
 # cortadoevaluator.py
 
 from typing import Any, List, Dict, Tuple, Optional
+import collections
 import datetime
 import concurrent.futures
 import logging
@@ -222,6 +223,84 @@ class CortadoEvaluator:
         except Exception as e:
             return None, str(e)
 
+def _group_dataset_by_conversation(dataset: List[Any]) -> List[Any]:
+    """Groups flat multi-turn requests sharing a conversation_id into single sequential scenario objects."""
+    if not dataset:
+        return []
+
+    conv_groups: Dict[str, List[Any]] = collections.defaultdict(list)
+    has_shared_conversations = False
+
+    for item in dataset:
+        raw = getattr(item, "raw_dict", item) if not isinstance(item, dict) else item
+        conv_id = (
+            getattr(item, "conversation_id", None)
+            or raw.get("conversation_id")
+            or raw.get("user_turn_sequence_id")
+            or raw.get("session_id")
+            or (raw.get("id") if raw.get("turns") else None)
+        )
+        if not conv_id:
+            conv_id = str(raw.get("id", id(item)))
+
+        conv_groups[str(conv_id)].append(item)
+        if len(conv_groups[str(conv_id)]) > 1:
+            has_shared_conversations = True
+
+    if not has_shared_conversations:
+        return dataset
+
+    logging.info(f"Grouped {len(dataset)} turn requests into {len(conv_groups)} distinct conversation sessions.")
+    grouped_dataset = []
+    for conv_id, items in conv_groups.items():
+        if len(items) == 1:
+            grouped_dataset.append(items[0])
+            continue
+
+        def _get_turn_num(it: Any) -> int:
+            r = getattr(it, "raw_dict", it) if not isinstance(it, dict) else it
+            return int(
+                getattr(it, "turn_id", None)
+                or r.get("turn_id")
+                or r.get("turn_index")
+                or r.get("turn")
+                or 0
+            )
+
+        sorted_items = sorted(items, key=_get_turn_num)
+        base_item = sorted_items[0]
+        base_raw = getattr(base_item, "raw_dict", base_item) if not isinstance(base_item, dict) else base_item
+
+        turns_list = []
+        for it in sorted_items:
+            r = getattr(it, "raw_dict", it) if not isinstance(it, dict) else it
+            prompt_text = (
+                getattr(it, "nl_prompt", None)
+                or r.get("nl_prompt")
+                or r.get("user_prompt")
+                or r.get("prompt")
+                or ""
+            )
+            golden_sql = getattr(it, "golden_sql", None) or r.get("golden_sql") or ""
+            turns_list.append({
+                "turn": _get_turn_num(it) or (len(turns_list) + 1),
+                "user_prompt": prompt_text,
+                "golden_sql": golden_sql,
+                "other": getattr(it, "other", None) or r.get("other", {}),
+            })
+
+        combined_raw = dict(base_raw)
+        combined_raw["id"] = conv_id
+        combined_raw["conversation_id"] = conv_id
+        combined_raw["turns"] = turns_list
+
+        from dataset.cortadoinput import EvalCortadoRequest
+        grouped_req = EvalCortadoRequest(raw_dict=combined_raw)
+        grouped_dataset.append(grouped_req)
+
+    return grouped_dataset
+
+
     def evaluate(self, dataset: List[EvalCortadoRequest], job_id: str, run_time: datetime.datetime):
         eval_outputs: List[Any] = []
         scoring_results: List[Any] = []
@@ -235,8 +314,11 @@ class CortadoEvaluator:
             "scorers": self.config.get("scorers", {}),
         }
 
+        # Ensure multi-turn requests sharing a conversation_id are grouped into sequential sessions
+        grouped_dataset = _group_dataset_by_conversation(dataset)
+
         # Spin up threads for concurrent conversation processing
-        for item in dataset:
+        for item in grouped_dataset:
             simulated_user = SimulatedUser(self.config)
             work = AgentGenWork(
                 processor=self.process_scenario,
@@ -247,7 +329,7 @@ class CortadoEvaluator:
             )
             self.agentrunner.execute_work(work)
 
-        total_items = len(dataset)
+        total_items = len(grouped_dataset)
         completed_items = 0
         logging.info(f"Dispatched {total_items} scenarios to workers. Processing...")
 

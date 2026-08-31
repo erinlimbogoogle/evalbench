@@ -258,14 +258,28 @@ class LLMRater(comparator.Comparator):
         database: str = "",
         **kwargs,
     ) -> Tuple[float, str]:
-        # Handle Disambiguation queries (ambiguous prompts where ground truth expects clarification)
-        is_ambiguous = (
+        # Extract disambiguation signals
+        generated_disambig = bool(
+            kwargs.get("generated_disambiguation_question")
+            or (isinstance(generated_eval_result, dict) and generated_eval_result.get("generated_disambiguation_question"))
+            or (isinstance(kwargs.get("other"), dict) and kwargs.get("other", {}).get("is_disambiguation") in ("true", True))
+        )
+
+        is_ambiguous = bool(
             kwargs.get("is_ambiguous", False)
             or (query_type and "disambig" in str(query_type).lower())
             or (not golden_query and not golden_execution_result and "disambig" in str(kwargs.get("id", "")).lower())
         )
 
+        # Case 3: Prompt is unambiguous, but agent asked an unnecessary clarification question
+        if not is_ambiguous and generated_disambig:
+            return 0.0, "FAIL: Agent asked an unnecessary clarification question on an unambiguous prompt."
+
         if is_ambiguous:
+            # Case 1 (Direct Tag / Question Output): If explicit disambiguation question output is tagged, instant pass
+            if generated_disambig:
+                return 100.0, "PASS: Correctly identified ambiguity and returned clarifying question."
+
             # Extract agent text / conversational response
             agent_response = ""
             if isinstance(generated_eval_result, dict):
@@ -281,7 +295,7 @@ class LLMRater(comparator.Comparator):
             if not agent_response and generated_query and generated_query != "skipped":
                 agent_response = generated_query
 
-            # If agent executed blind SQL without asking clarification, fail immediately
+            # Case 2: Agent executed blind SQL without asking clarification on an ambiguous prompt
             if (
                 generated_query
                 and generated_query.strip().upper().startswith(("SELECT", "WITH", "CREATE", "INSERT"))
@@ -289,6 +303,7 @@ class LLMRater(comparator.Comparator):
             ):
                 return 0.0, "FAIL: Agent executed blind SQL on an ambiguous prompt instead of asking for clarification."
 
+            # Case 1 (LLM Rubric evaluation of agent's natural language response)
             prompt = BREWMAX_DISAMBIGUATION_PROMPT.format(
                 nl_prompt=nl_prompt,
                 agent_response=agent_response if agent_response else "No response",
