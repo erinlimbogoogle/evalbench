@@ -327,6 +327,28 @@ def _row_to_eval_output(row: dict) -> dict:
     if not isinstance(metadata, dict):
         metadata = {}
 
+    other = _safe_parse(row.get("other"), {})
+    if not isinstance(other, dict):
+        other = {}
+
+    is_ambiguous = (
+        row.get("is_ambiguous")
+        if pd.notna(row.get("is_ambiguous")) and str(row.get("is_ambiguous")).strip() != ""
+        else (scenario.get("is_ambiguous") or other.get("is_ambiguous") or metadata.get("is_ambiguous", False))
+    )
+    if isinstance(is_ambiguous, str):
+        is_ambiguous = is_ambiguous.lower() in ("true", "1", "t", "yes")
+    else:
+        is_ambiguous = bool(is_ambiguous)
+
+    generated_disambig = (
+        row.get("generated_disambiguation_question")
+        or row.get("disambiguation_question")
+        or other.get("generated_disambiguation_question")
+        or other.get("disambiguation_question")
+        or scenario.get("generated_disambiguation_question")
+    )
+
     accumulated_tools = _safe_parse(row.get("accumulated_tools"), [])
     if not isinstance(accumulated_tools, list):
         accumulated_tools = []
@@ -375,6 +397,9 @@ def _row_to_eval_output(row: dict) -> dict:
         "accumulated_skills": accumulated_skills,
         "job_id": str(row.get("job_id") or "rescored_job"),
         "metadata": metadata,
+        "other": other,
+        "is_ambiguous": is_ambiguous,
+        "generated_disambiguation_question": generated_disambig,
     }
     return eval_output
 
@@ -417,6 +442,7 @@ def rescore(
     reexecute_sql: bool = False,
     reexecute_on_empty: bool = False,
     save_refreshed_evals: bool = False,
+    prompt_template: Optional[str] = None,
 ) -> pd.DataFrame:
     """Executes offline rescoring across all traces in parallel."""
     # 1. Load Configurations
@@ -424,6 +450,14 @@ def rescore(
     session = {}
     set_session_configs(session, parsed_config)
     config, db_configs, model_config, setup_config = load_session_configs(session)
+
+    if prompt_template:
+        scorers_cfg = config.setdefault("scorers", {})
+        if "llmrater" in scorers_cfg and isinstance(scorers_cfg["llmrater"], dict):
+            scorers_cfg["llmrater"]["prompt_template"] = prompt_template
+        else:
+            scorers_cfg["llmrater"] = {"prompt_template": prompt_template}
+        logging.info(f"Overriding LLM rater prompt_template: '{prompt_template}'")
 
     # 2. Load Traces
     traces = load_traces(results_file)
@@ -646,6 +680,13 @@ def main():
         help="Save refreshed execution traces and turn histories to evals_refreshed.csv in output directory.",
     )
 
+    parser.add_argument(
+        "--prompt_template",
+        "-p",
+        default=None,
+        help="Optional prompt template override for LLM rater (e.g. 'brewmax' or 'default').",
+    )
+
     args = parser.parse_args()
     rescore(
         results_file=args.results_file,
@@ -657,6 +698,7 @@ def main():
         reexecute_sql=args.reexecute_sql,
         reexecute_on_empty=args.reexecute_on_empty,
         save_refreshed_evals=args.save_refreshed_evals,
+        prompt_template=args.prompt_template,
     )
 
 

@@ -39,7 +39,10 @@ class SessionManager:
     ):
         self.running = True
         self.sessions = {}
-        self.ttl = 10800
+        try:
+            self.ttl = int(os.environ.get("EVALBENCH_SESSION_TTL_SECONDS", os.environ.get("SESSION_TTL_SECONDS", 10800)))
+        except (ValueError, TypeError):
+            self.ttl = 10800
         self.lock = RWLock()
         self.load_sessions_from_disk()
         logging.debug("Starting reaper...")
