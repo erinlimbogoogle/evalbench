@@ -49,6 +49,48 @@ class TestCortadoOrchestrator(unittest.TestCase):
             self.assertEqual(len(scores_data), 1)
             self.assertEqual(scores_data[0]["score"], 100)
 
+    @patch("evaluator.cortadoorchestrator.CortadoEvaluator")
+    def test_process_sanitizes_large_result_sets(self, mock_evaluator_class):
+        # Create a massive simulated result set (10,000 rows)
+        huge_table = [{"col": i} for i in range(10000)]
+        mock_evaluator = MagicMock()
+        mock_evaluator.evaluate.return_value = (
+            [
+                {
+                    "eval_id": "huge_scenario",
+                    "generated_result": huge_table,
+                    "golden_result": huge_table,
+                    "turn_history": [
+                        {
+                            "turn": 1,
+                            "generated_execution_result": huge_table,
+                            "golden_execution_result": huge_table,
+                        }
+                    ],
+                }
+            ],
+            [{"eval_id": "huge_scenario", "score": 100}],
+        )
+        mock_evaluator_class.return_value = mock_evaluator
+
+        orchestrator = CortadoOrchestrator(
+            config={"runners": {"eval_runners": 1}},
+            db_configs={},
+            setup_config={},
+        )
+        orchestrator.evaluate([MagicMock()])
+        _, _, results_tf, scores_tf, _ = orchestrator.process()
+
+        with open(results_tf, "r") as f:
+            data = json.load(f)
+            self.assertEqual(len(data), 1)
+            # Verify rows are truncated to 50 max
+            self.assertEqual(len(data[0]["generated_result"]), 50)
+            self.assertEqual(len(data[0]["golden_result"]), 50)
+            self.assertEqual(
+                len(data[0]["turn_history"][0]["generated_execution_result"]), 50
+            )
+
     def test_extract_golden_sql_structured_turns(self):
         from evaluator.cortadoevaluator import extract_golden_sql_for_turn
         scenario = {

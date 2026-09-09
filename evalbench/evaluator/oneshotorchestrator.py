@@ -11,7 +11,7 @@ import databases
 from dataset.evalinput import EvalInputRequest, breakdown_datasets
 from evaluator.db_manager import build_db_queue
 from evaluator.evaluator import Evaluator
-from evaluator.orchestrator import Orchestrator
+from evaluator.orchestrator import Orchestrator, sanitize_eval_output, dump_compact_json
 from evaluator.progress_reporter import (
     cleanup_progress_reporting,
     record_successful_setup,
@@ -252,30 +252,21 @@ class OneShotOrchestrator(Orchestrator):
         )
 
     def process(self):
+        sanitized_evals = [sanitize_eval_output(item) for item in self.total_eval_outputs]
         with tempfile.NamedTemporaryFile(
             mode="w", delete=False, suffix=".json"
         ) as f:
-            json.dump(
-                self.total_eval_outputs, f, sort_keys=True, indent=4, default=str
-            )
+            dump_compact_json(sanitized_evals, f)
             results_tf = f.name
         with tempfile.NamedTemporaryFile(
             mode="w", delete=False, suffix=".json"
         ) as f:
-            json.dump(
-                self.total_scoring_results, f, sort_keys=True, indent=4, default=str
-            )
+            dump_compact_json(self.total_scoring_results, f)
             scores_tf = f.name
         with tempfile.NamedTemporaryFile(
             mode="w", delete=False, suffix=".json"
         ) as f:
-            json.dump(
-                self.total_multi_trial_scoring_results,
-                f,
-                sort_keys=True,
-                indent=4,
-                default=str,
-            )
+            dump_compact_json(self.total_multi_trial_scoring_results, f)
             multi_trial_scores_tf = f.name
         return (
             self.job_id,

@@ -1,4 +1,4 @@
-from evaluator.orchestrator import Orchestrator
+from evaluator.orchestrator import Orchestrator, sanitize_eval_output, dump_compact_json
 import uuid
 import datetime
 import tempfile
@@ -26,12 +26,11 @@ class CortadoOrchestrator(Orchestrator):
         self.total_scoring_results.extend(scoring_results)
 
     def process(self):
+        sanitized_evals = [sanitize_eval_output(item) for item in self.total_eval_outputs]
         with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as f:
-            json.dump(self.total_eval_outputs, f,
-                      sort_keys=True, indent=4, default=str)
+            dump_compact_json(sanitized_evals, f)
             results_tf = f.name
         with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as f:
-            json.dump(self.total_scoring_results, f,
-                      sort_keys=True, indent=4, default=str)
+            dump_compact_json(self.total_scoring_results, f)
             scores_tf = f.name
         return self.job_id, self.run_time, results_tf, scores_tf, None

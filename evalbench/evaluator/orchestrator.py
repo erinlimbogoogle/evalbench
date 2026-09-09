@@ -1,7 +1,47 @@
 import datetime
+import json
+from typing import Any, List, Dict
 import uuid
 
 from dataset.evalinput import EvalInputRequest
+
+
+def sanitize_eval_output(item: Any, max_rows: int = 50) -> Any:
+    """Truncates large result sets and telemetry arrays to prevent memory explosion during JSON serialization."""
+    if not isinstance(item, dict):
+        return item
+
+    sanitized = dict(item)
+
+    # 1. Truncate top-level result lists
+    for key in ("generated_result", "golden_result", "accumulated_tools", "accumulated_skills"):
+        val = sanitized.get(key)
+        if isinstance(val, list) and len(val) > max_rows:
+            sanitized[key] = val[:max_rows]
+
+    # 2. Truncate turn_history tables
+    turn_history = sanitized.get("turn_history")
+    if isinstance(turn_history, list):
+        sanitized_turns = []
+        for t in turn_history:
+            if isinstance(t, dict):
+                t_copy = dict(t)
+                for t_key in ("generated_execution_result", "golden_execution_result", "tools"):
+                    t_val = t_copy.get(t_key)
+                    if isinstance(t_val, list) and len(t_val) > max_rows:
+                        t_copy[t_key] = t_val[:max_rows]
+                sanitized_turns.append(t_copy)
+            else:
+                sanitized_turns.append(t)
+        sanitized["turn_history"] = sanitized_turns
+
+    return sanitized
+
+
+def dump_compact_json(data: Any, temp_file) -> str:
+    """Dumps data to a temporary file using compact separators and returns the file path."""
+    json.dump(data, temp_file, sort_keys=True, separators=(",", ":"), default=str)
+    return temp_file.name
 
 
 # The `Orchestrator` class is a Python class that serves as a central component for
